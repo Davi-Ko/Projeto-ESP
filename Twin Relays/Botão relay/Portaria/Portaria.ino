@@ -22,7 +22,12 @@ extern "C" {
 #define ACK_TIMEOUT_MS     3000           // Aumentado para 3 segundos
 #define MAX_RETRY_ATTEMPTS 3
 #define COMMAND_DELAY      300            // Delay antes de enviar comando
-
+typedef struct {
+    uint8_t deviceId;
+    uint8_t command;
+    uint8_t relayState;
+    char message[32];
+} esp_now_message;
 // ============== Estruturas de Pareamento =============
 struct PairStore {
   uint32_t magic;
@@ -302,18 +307,19 @@ void onDataSent(uint8_t *mac, uint8_t status) {
 }
 
 void onDataRecv(uint8_t *mac, uint8_t *data, uint8_t len) {
-  char msg[32] = {0};
-  if (len > sizeof(msg) - 1) len = sizeof(msg) - 1;
-  memcpy(msg, data, len);
-  msg[len] = '\0';
+  if (len != sizeof(esp_now_message)) return;
+
+  esp_now_message msg;
+  memcpy(&msg, data, sizeof(msg));
 
   Serial.printf("=== RESPOSTA RECEBIDA ===\n");
-  Serial.printf("Mensagem: '%s'\n", msg);
+  Serial.printf("deviceId=%d, cmd=%d, estado=%d, msg=%s\n",
+              msg.deviceId, msg.command, msg.relayState, msg.message);
   Serial.printf("De: %s\n", macToStr(mac).c_str());
 
   // Resposta do portão durante pareamento
   if (!gPaired || gDiscoveryMode) {
-    if (strcmp(msg, "READY") == 0) {
+    if (strcmp(msg.message, "READY") == 0) {
       Serial.println("READY recebido - Estabelecendo pareamento...");
       memcpy(gPair.peer, mac, 6);
       gPair.channel = AP_CHANNEL;
@@ -327,7 +333,7 @@ void onDataRecv(uint8_t *mac, uint8_t *data, uint8_t len) {
   }
   
   // ACK de comando
-  if (gPaired && strcmp(msg, "ACK") == 0) {
+  if (gPaired && strcmp(msg.message, "ACK") == 0) {
     gAckReceived = true;
     Serial.println("ACK DE COMANDO RECEBIDO - Sucesso!");
   }
@@ -372,7 +378,13 @@ void handleOpen(){
   }
 
   Serial.println("=== INICIANDO COMANDO ABRIR ===");
-  const char *cmd = "ABRIR";
+  
+  esp_now_message msg;
+  msg.deviceId = 1;                 // ID do ESP do portão
+  msg.command = 1;                  // 1 = abrir
+  msg.relayState = 0;               // Estado não é importante aqui
+  strcpy(msg.message, "ABRIR");     // Texto só para log/debug
+
   gAckReceived = false;
   bool success = false;
 
@@ -386,7 +398,7 @@ void handleOpen(){
     delay(COMMAND_DELAY);
     
     // Envia o comando
-    int result = esp_now_send(gPair.peer, (uint8_t*)cmd, strlen(cmd));
+    int result = esp_now_send(gPair.peer, (uint8_t*)&msg, sizeof(msg));
     Serial.printf("Comando enviado para %s - Resultado: %s\n", 
                   macToStr(gPair.peer).c_str(), result == 0 ? "OK" : "ERRO");
     
