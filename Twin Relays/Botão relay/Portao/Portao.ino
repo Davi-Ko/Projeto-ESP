@@ -8,28 +8,37 @@ extern "C" {
 #define RELAY_ACTIVE_HIGH true
 #define RELAY_PIN 0    // GPIO0 - Pino físico 5 do ESP-01
 #define LED_PIN 2      // GPIO2 - Pino físico 3 do ESP-01 (LED onboard)
-#define DEVICE_ID 1
+
+// *** CONFIGURE AQUI O ID ÚNICO DO SEU PORTÃO ***
+#define UNIQUE_DEVICE_ID 101   // MUDE ESTE NÚMERO PARA CADA PAR (101, 102, 103, etc.)
+// PORTARIA deve ter o MESMO NÚMERO!
+
 #define CHANNEL 1
 #define EEPROM_SIZE 64
 #define EEPROM_PEER_ADDR 0
 
 #define HELLO_RESPONSE_INTERVAL 500
-#define ACK_DELAY 200  // Delay antes de enviar ACK
-#define RELAY_PULSE_TIME 1000  // Tempo do pulso do relé em ms
+#define ACK_DELAY 200           
+#define RELAY_PULSE_TIME 1000   
+#define READY_DELAY 50          
+#define READY_PULSE_INTERVAL 5000  
+#define COMMAND_COOLDOWN 2000     
 // ==========================================
 
 uint8_t peerMac[6];
 bool paired = false;
 bool relayState = false;
 uint32_t lastHelloResponse = 0;
+uint32_t lastReadyPulse = 0;
+uint32_t lastCommandTime = 0;
 
 typedef struct {
-    uint8_t deviceId;
-    uint8_t command;
-    uint8_t relayState;
-    char message[32];
+    uint16_t uniqueId;        // ID único do dispositivo
+    uint8_t deviceType;       // 1=Portão, 2=Portaria
+    uint8_t command;          // Comando
+    uint8_t relayState;       // Estado do relé
+    char message[28];         // Reduzido para caber o uniqueId
 } esp_now_message;
-
 
 String macToStr(const uint8_t mac[6]) {
   char buf[20];
@@ -43,26 +52,41 @@ void savePeer(uint8_t *mac) {
   for (int i = 0; i < 6; i++) {
     EEPROM.write(EEPROM_PEER_ADDR + i, mac[i]);
   }
+  // Salva também o ID único para validação
+  EEPROM.write(EEPROM_PEER_ADDR + 6, (UNIQUE_DEVICE_ID >> 8) & 0xFF);
+  EEPROM.write(EEPROM_PEER_ADDR + 7, UNIQUE_DEVICE_ID & 0xFF);
   EEPROM.commit();
-  Serial.printf("Peer salvo: %s\n", macToStr(mac).c_str());
+  Serial.printf("Peer salvo: %s (ID: %d)\n", macToStr(mac).c_str(), UNIQUE_DEVICE_ID);
 }
 
 bool loadPeer() {
   EEPROM.begin(EEPROM_SIZE);
   bool empty = true;
+  
+  // Carrega MAC
   for (int i = 0; i < 6; i++) {
     peerMac[i] = EEPROM.read(EEPROM_PEER_ADDR + i);
     if (peerMac[i] != 0xFF && peerMac[i] != 0x00) empty = false;
   }
-  if (!empty) {
-    Serial.printf("Peer carregado: %s\n", macToStr(peerMac).c_str());
+  
+  // Verifica ID salvo
+  uint16_t savedId = (EEPROM.read(EEPROM_PEER_ADDR + 6) << 8) | EEPROM.read(EEPROM_PEER_ADDR + 7);
+  
+  if (!empty && savedId == UNIQUE_DEVICE_ID) {
+    Serial.printf("Peer carregado: %s (ID válido: %d)\n", macToStr(peerMac).c_str(), savedId);
+    return true;
+  } else if (!empty) {
+    Serial.printf("Peer encontrado mas ID diferente: %d (esperado: %d) - Limpando...\n", 
+                  savedId, UNIQUE_DEVICE_ID);
+    clearPeer();
   }
-  return !empty;
+  
+  return false;
 }
 
 void clearPeer() {
   EEPROM.begin(EEPROM_SIZE);
-  for (int i = 0; i < 6; i++) {
+  for (int i = 0; i < 8; i++) { // Limpa MAC + ID
     EEPROM.write(EEPROM_PEER_ADDR + i, 0xFF);
   }
   EEPROM.commit();
@@ -71,20 +95,18 @@ void clearPeer() {
   Serial.println("Pareamento limpo");
 }
 
-void sendMessage(uint8_t *mac, const char *msg) {
-  // Garante que o peer está adicionado antes de enviar
+void ensurePeerAdded(uint8_t *mac) {
   esp_now_del_peer(mac);
-  int addResult = esp_now_add_peer(mac, ESP_NOW_ROLE_COMBO, CHANNEL, NULL, 0);
-  
-  if (addResult == 0) {
-    int result = esp_now_send(mac, (uint8_t*)msg, strlen(msg));
-    Serial.printf("Enviando '%s' para %s - Add: %s, Send: %s\n", 
-                  msg, macToStr(mac).c_str(), 
-                  addResult == 0 ? "OK" : "ERRO",
-                  result == 0 ? "OK" : "ERRO");
-  } else {
-    Serial.printf("ERRO ao adicionar peer %s: %d\n", macToStr(mac).c_str(), addResult);
-  }
+  int result = esp_now_add_peer(mac, ESP_NOW_ROLE_COMBO, CHANNEL, NULL, 0);
+  Serial.printf("Peer %s %s\n", macToStr(mac).c_str(), 
+                result == 0 ? "adicionado" : "ERRO ao adicionar");
+}
+
+void sendMessage(uint8_t *mac, esp_now_message *msg) {
+  ensurePeerAdded(mac);
+  int result = esp_now_send(mac, (uint8_t*)msg, sizeof(esp_now_message));
+  Serial.printf("Enviando para %s - Resultado: %s\n", 
+                macToStr(mac).c_str(), result == 0 ? "OK" : "ERRO");
 }
 
 void onDataSent(uint8_t *mac, uint8_t status) {
@@ -93,27 +115,37 @@ void onDataSent(uint8_t *mac, uint8_t status) {
 }
 
 void onDataRecv(uint8_t *mac, uint8_t *data, uint8_t len) {
+  Serial.printf("=== MENSAGEM RECEBIDA ===\n");
+  Serial.printf("De: %s, Tamanho: %d bytes\n", macToStr(mac).c_str(), len);
+
   if (len != sizeof(esp_now_message)) {
-    Serial.printf("Tamanho inválido (%d bytes), esperado %d\n", len, sizeof(esp_now_message));
+    Serial.printf("Tamanho incorreto: %d (esperado: %d) - Ignorando\n", len, sizeof(esp_now_message));
     return;
   }
 
   esp_now_message msg;
   memcpy(&msg, data, sizeof(msg));
 
-  Serial.printf("=== COMANDO RECEBIDO ===\n");
-  Serial.printf("De: %s\n", macToStr(mac).c_str());
-  Serial.printf("deviceId=%d, command=%d, relayState=%d, msg=%s\n",
-                msg.deviceId, msg.command, msg.relayState, msg.message);
+  Serial.printf("uniqueId=%d, deviceType=%d, command=%d, relayState=%d, msg=%s\n",
+                msg.uniqueId, msg.deviceType, msg.command, msg.relayState, msg.message);
 
-  // Se não for pra mim, ignora
-  if (msg.deviceId != MEU_ID) {
-    Serial.println("Mensagem não é para mim, ignorando...");
+  // *** VERIFICAÇÃO DE ID ÚNICO ***
+  if (msg.uniqueId != UNIQUE_DEVICE_ID) {
+    Serial.printf("ID INCOMPATÍVEL: %d (esperado: %d) - IGNORANDO MENSAGEM\n", 
+                  msg.uniqueId, UNIQUE_DEVICE_ID);
     return;
   }
 
-  // --- PAREAMENTO ---
+  // Verifica se é de uma Portaria (deviceType = 2)
+  if (msg.deviceType != 2) {
+    Serial.printf("Tipo de dispositivo incorreto: %d (esperado: 2=Portaria) - Ignorando\n", msg.deviceType);
+    return;
+  }
+
+  // --- PAREAMENTO (HELLO) ---
   if (msg.command == 0 && strcmp(msg.message, "HELLO") == 0) {
+    Serial.printf("=== HELLO RECEBIDO (ID: %d) ===\n", msg.uniqueId);
+    
     if (millis() - lastHelloResponse < HELLO_RESPONSE_INTERVAL) {
       Serial.println("HELLO ignorado (rate limit)");
       return;
@@ -125,99 +157,139 @@ void onDataRecv(uint8_t *mac, uint8_t *data, uint8_t len) {
       savePeer(mac);
       paired = true;
       digitalWrite(LED_PIN, HIGH);
-      Serial.printf("PAREAMENTO INICIAL com %s\n", macToStr(mac).c_str());
+      Serial.printf("PAREAMENTO INICIAL com %s (ID: %d)\n", macToStr(mac).c_str(), msg.uniqueId);
     } else {
-      Serial.printf("HELLO de peer conhecido: %s\n", macToStr(mac).c_str());
+      Serial.printf("HELLO de peer conhecido: %s (ID: %d)\n", macToStr(mac).c_str(), msg.uniqueId);
     }
 
     // Responde com READY
-    delay(50);
+    delay(READY_DELAY);
     esp_now_message resp;
-    resp.deviceId = MEU_ID;
+    resp.uniqueId = UNIQUE_DEVICE_ID;
+    resp.deviceType = 1;  // 1 = Portão
     resp.command = 0;
     resp.relayState = digitalRead(RELAY_PIN);
     strcpy(resp.message, "READY");
-    esp_now_send(mac, (uint8_t*)&resp, sizeof(resp));
+    sendMessage(mac, &resp);
+    
     return;
   }
 
   // --- COMANDO ABRIR ---
   if (msg.command == 1) {
-    Serial.println("=== PROCESSANDO COMANDO ABRIR ===");
+    Serial.printf("=== PROCESSANDO COMANDO ABRIR (ID: %d) ===\n", msg.uniqueId);
+
+    // Verifica cooldown para evitar comandos duplicados
+    if (millis() - lastCommandTime < COMMAND_COOLDOWN) {
+      Serial.printf("COMANDO IGNORADO - Cooldown ativo (%lu ms restantes)\n", 
+                   COMMAND_COOLDOWN - (millis() - lastCommandTime));
+      
+      // Mesmo assim envia ACK
+      esp_now_message ack;
+      ack.uniqueId = UNIQUE_DEVICE_ID;
+      ack.deviceType = 1;  // 1 = Portão
+      ack.command = 0;
+      ack.relayState = digitalRead(RELAY_PIN);
+      strcpy(ack.message, "ACK");
+      sendMessage(mac, &ack);
+      return;
+    }
+    
+    lastCommandTime = millis();
 
     if (!paired) {
       memcpy(peerMac, mac, 6);
       savePeer(mac);
       paired = true;
       digitalWrite(LED_PIN, HIGH);
-      Serial.printf("AUTO-PAREAMENTO com %s\n", macToStr(mac).c_str());
+      Serial.printf("AUTO-PAREAMENTO com %s (ID: %d)\n", macToStr(mac).c_str(), msg.uniqueId);
     }
+
+    // ENVIA ACK IMEDIATAMENTE
+    Serial.println("ENVIANDO ACK...");
+    
+    esp_now_message ack;
+    ack.uniqueId = UNIQUE_DEVICE_ID;
+    ack.deviceType = 1;  // 1 = Portão
+    ack.command = 0;
+    ack.relayState = digitalRead(RELAY_PIN);
+    strcpy(ack.message, "ACK");
+    
+    int result = esp_now_send(mac, (uint8_t*)&ack, sizeof(ack));
+    Serial.printf("ACK enviado - Resultado: %s\n", result == 0 ? "SUCESSO" : "ERRO");
+    
+    delay(100);
 
     // Aciona o relé
     Serial.println("ACIONANDO RELÉ...");
     digitalWrite(RELAY_PIN, RELAY_ACTIVE_HIGH ? HIGH : LOW);
+    
+    // Pisca LED uma vez
+    digitalWrite(LED_PIN, LOW);
+    delay(200);
+    digitalWrite(LED_PIN, HIGH);
+    delay(200);
+    digitalWrite(LED_PIN, LOW);
+    delay(200);
+    digitalWrite(LED_PIN, HIGH);
+    
     delay(RELAY_PULSE_TIME);
     digitalWrite(RELAY_PIN, RELAY_ACTIVE_HIGH ? LOW : HIGH);
     Serial.println("RELÉ DESLIGADO");
 
-    // Pisca LED
-    for (int i = 0; i < 3; i++) {
-      digitalWrite(LED_PIN, LOW);
-      delay(100);
-      digitalWrite(LED_PIN, HIGH);
-      delay(100);
-    }
-
-    // Responde com ACK
-    delay(ACK_DELAY);
-    esp_now_message ack;
-    ack.deviceId = MEU_ID;
-    ack.command = 0;
-    ack.relayState = digitalRead(RELAY_PIN);
-    strcpy(ack.message, "ACK");
-    esp_now_send(mac, (uint8_t*)&ack, sizeof(ack));
-
-    Serial.println("=== COMANDO ABRIR FINALIZADO ===");
+    Serial.printf("=== COMANDO ABRIR FINALIZADO (ID: %d) ===\n", msg.uniqueId);
     return;
   }
 
   Serial.printf("Comando não reconhecido (cmd=%d, msg=%s)\n", msg.command, msg.message);
 }
 
+void sendReadyPulse() {
+  if (paired && millis() - lastReadyPulse > READY_PULSE_INTERVAL) {
+    lastReadyPulse = millis();
+    
+    Serial.printf("=== ENVIANDO READY PULSE (ID: %d) ===\n", UNIQUE_DEVICE_ID);
+    
+    esp_now_message resp;
+    resp.uniqueId = UNIQUE_DEVICE_ID;
+    resp.deviceType = 1;  // 1 = Portão
+    resp.command = 0;
+    resp.relayState = digitalRead(RELAY_PIN);
+    strcpy(resp.message, "READY");
+    sendMessage(peerMac, &resp);
+    
+    Serial.printf("READY pulse enviado para %s\n", macToStr(peerMac).c_str());
+  }
+}
 
 void setup() {
   Serial.begin(115200);
   delay(500);
   Serial.println();
   Serial.println("===========================================");
-  Serial.println("ESP-01 PORTÃO - Sistema de Controle");
+  Serial.printf("ESP-01 PORTÃO - ID ÚNICO: %d\n", UNIQUE_DEVICE_ID);
   Serial.println("===========================================");
 
   // Configuração dos pinos
   pinMode(RELAY_PIN, OUTPUT);
   pinMode(LED_PIN, OUTPUT);
   
-  // Estado inicial dos pinos
-  digitalWrite(RELAY_PIN, RELAY_ACTIVE_HIGH ? LOW : HIGH); // Relé desligado
-  digitalWrite(LED_PIN, LOW); // LED apagado inicialmente
+  digitalWrite(RELAY_PIN, RELAY_ACTIVE_HIGH ? LOW : HIGH);
+  digitalWrite(LED_PIN, LOW);
   
-  Serial.printf("Pino do Relé: GPIO%d (físico: %s)\n", RELAY_PIN, RELAY_PIN == 0 ? "5" : "desconhecido");
-  Serial.printf("Pino do LED: GPIO%d (físico: %s)\n", LED_PIN, LED_PIN == 2 ? "3" : "desconhecido");
-  Serial.printf("Estado inicial do relé: %s\n", RELAY_ACTIVE_HIGH ? "LOW (desligado)" : "HIGH (desligado)");
+  Serial.printf("ID Único do Dispositivo: %d\n", UNIQUE_DEVICE_ID);
+  Serial.printf("Tipo: 1 (Portão)\n");
+  Serial.printf("Pino do Relé: GPIO%d\n", RELAY_PIN);
+  Serial.printf("Pino do LED: GPIO%d\n", LED_PIN);
 
-  // WiFi em modo STA (necessário para ESP-NOW)
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
-  
-  // Força o canal do WiFi
   wifi_set_channel(CHANNEL);
 
   uint8_t myMac[6];
   wifi_get_macaddr(STATION_IF, myMac);
   Serial.printf("MAC do Portão: %s\n", macToStr(myMac).c_str());
-  Serial.printf("Canal forçado: %d\n", CHANNEL);
 
-  // Inicializa ESP-NOW
   if (esp_now_init() != 0) {
     Serial.println("ERRO CRÍTICO: Falha ao inicializar ESP-NOW!");
     while(true) {
@@ -230,37 +302,52 @@ void setup() {
   esp_now_register_send_cb(onDataSent);
   esp_now_register_recv_cb(onDataRecv);
 
-  // Carrega pareamento salvo da EEPROM
   if (loadPeer()) {
     paired = true;
     digitalWrite(LED_PIN, HIGH);
     Serial.printf("SISTEMA RESTAURADO - Pareado com: %s\n", macToStr(peerMac).c_str());
-    Serial.println("Aguardando comandos...");
+    
+    // Envia READY inicial
+    delay(1000);
+    esp_now_message resp;
+    resp.uniqueId = UNIQUE_DEVICE_ID;
+    resp.deviceType = 1;
+    resp.command = 0;
+    resp.relayState = digitalRead(RELAY_PIN);
+    strcpy(resp.message, "READY");
+    sendMessage(peerMac, &resp);
+    
+    lastReadyPulse = millis();
+    
   } else {
-    Serial.println("NENHUM PAREAMENTO - Aguardando descoberta via HELLO...");
+    Serial.printf("NENHUM PAREAMENTO - Aguardando Portaria com ID: %d\n", UNIQUE_DEVICE_ID);
   }
 
   Serial.println("===========================================");
-  Serial.println("SISTEMA DO PORTÃO INICIADO E PRONTO!");
-  Serial.printf("Configuração do Relé: %s\n", 
-                RELAY_ACTIVE_HIGH ? "ATIVO_ALTO" : "ATIVO_BAIXO");
-  Serial.printf("Tempo de pulso: %d ms\n", RELAY_PULSE_TIME);
+  Serial.printf("PORTÃO PRONTO! Aceita apenas ID: %d\n", UNIQUE_DEVICE_ID);
   Serial.println("===========================================");
   
-  // Teste inicial do relé
-  Serial.println("Realizando teste do relé...");
+  // Teste do relé
+  Serial.println("Teste do relé...");
   digitalWrite(RELAY_PIN, RELAY_ACTIVE_HIGH ? HIGH : LOW);
-  delay(200);
+  delay(100);
   digitalWrite(RELAY_PIN, RELAY_ACTIVE_HIGH ? LOW : HIGH);
-  Serial.println("Teste do relé concluído!");
+  
+  // Pisca LED 3 vezes
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(LED_PIN, HIGH);
+    delay(200);
+    digitalWrite(LED_PIN, LOW);
+    delay(200);
+  }
+  
+  if (paired) {
+    digitalWrite(LED_PIN, HIGH);
+  }
 }
 
 void loop() {
-  // Sistema baseado em eventos - aguarda comandos via ESP-NOW
-  // Status do LED:
-  // - LED apagado: não pareado
-  // - LED aceso: pareado e pronto
-  // - LED piscando: comando sendo executado
-  
-  yield(); // Permite que o sistema execute outras tarefas
+  sendReadyPulse();
+  yield();
+  delay(100);
 }

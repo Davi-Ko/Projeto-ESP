@@ -1,8 +1,5 @@
 // ===================== PORTARIA (ESP8266/ESP-01) =====================
-// - Cria AP "Portaria-ESP" com Web UI para acionar o portão
-// - Pareamento automático via ESP-NOW (compatível com Portão simplificado)
-// - Salva pareamento na EEPROM; /unpair limpa e reinicia descoberta
-// - /open envia comando e aguarda ACK com retentativas
+// Sistema com ID único para pareamento específico
 // =====================================================================
 
 #include <ESP8266WiFi.h>
@@ -15,19 +12,27 @@ extern "C" {
 // ===================== CONFIG =====================
 #define AP_SSID            "Portaria-ESP"
 #define AP_PASS            "12345678"
-#define AP_CHANNEL         1              // Mesmo canal do Portão
+#define AP_CHANNEL         1
 #define AP_MAX_CONN        2
 
-#define HELLO_INTERVAL_MS  3000           // Aumentado para 3 segundos
-#define ACK_TIMEOUT_MS     3000           // Aumentado para 3 segundos
-#define MAX_RETRY_ATTEMPTS 3
-#define COMMAND_DELAY      300            // Delay antes de enviar comando
+// *** CONFIGURE AQUI O MESMO ID DO PORTÃO ***
+#define UNIQUE_DEVICE_ID 101   // DEVE SER IGUAL AO DO PORTÃO!
+
+#define HELLO_INTERVAL_MS  3000           
+#define ACK_TIMEOUT_MS     2000           
+#define MAX_RETRY_ATTEMPTS 2              
+#define COMMAND_DELAY      500            
+#define HELLO_TIMEOUT      20000          
+#define RECONNECT_INTERVAL 30000          
+
 typedef struct {
-    uint8_t deviceId;
-    uint8_t command;
-    uint8_t relayState;
-    char message[32];
+    uint16_t uniqueId;        // ID único do dispositivo
+    uint8_t deviceType;       // 1=Portão, 2=Portaria
+    uint8_t command;          // Comando
+    uint8_t relayState;       // Estado do relé
+    char message[28];         // Reduzido para caber o uniqueId
 } esp_now_message;
+
 // ============== Estruturas de Pareamento =============
 struct PairStore {
   uint32_t magic;
@@ -35,7 +40,8 @@ struct PairStore {
   uint8_t  channel;
   uint8_t  flags;
   uint32_t timestamp;
-  uint8_t  reserved[16];
+  uint16_t uniqueId;        // ID único salvo
+  uint8_t  reserved[14];    // Reduzido para caber uniqueId
 };
 
 #define EEPROM_SIZE  64
@@ -45,12 +51,15 @@ struct PairStore {
 PairStore gPair{};
 bool gPaired = false;
 volatile bool gDiscoveryMode = true;
+volatile bool gReadyReceived = false;
 
 ESP8266WebServer server(80);
 uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 uint8_t myMac[6]{};
 volatile bool gAckReceived = false;
 uint32_t lastHello = 0;
+uint32_t lastReconnectAttempt = 0;
+volatile uint32_t lastReadyReceived = 0;
 
 // =================== Interface Web ===================
 const char INDEX_HTML[] PROGMEM = R"rawliteral(
@@ -80,6 +89,10 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
             margin-bottom: 10px; text-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
         }
         .subtitle { color: #666; font-size: 1.1em; font-weight: 300; }
+        .device-id {
+            background: #e3f2fd; border: 2px solid #2196F3; border-radius: 10px;
+            padding: 10px; margin: 15px 0; font-weight: bold; color: #1976D2;
+        }
         .status-card {
             background: #f8f9ff; border-radius: 15px; padding: 25px;
             margin: 30px 0; border-left: 5px solid #667eea;
@@ -105,6 +118,9 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         }
         .disconnected {
             background: linear-gradient(135deg, #f44336, #d32f2f); color: white;
+        }
+        .discovering {
+            background: linear-gradient(135deg, #ff9800, #f57c00); color: white;
         }
         .main-button {
             background: linear-gradient(135deg, #667eea, #764ba2);
@@ -141,7 +157,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         }
         .footer-link {
             color: #667eea; text-decoration: none; font-weight: 600;
-            transition: color 0.3s ease;
+            transition: color 0.3s ease; margin: 0 10px;
         }
         .footer-link:hover { color: #764ba2; text-decoration: underline; }
         .loading {
@@ -168,6 +184,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         <div class="header">
             <h1 class="title">🏠 Portaria</h1>
             <p class="subtitle">Controle do Portao Eletronico</p>
+            <div class="device-id">ID Único: )" + String(UNIQUE_DEVICE_ID) + R"rawliteral(</div>
         </div>
         <div class="status-card">
             <div class="status-item">
@@ -182,13 +199,19 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                 <span class="status-label">MAC Portao:</span>
                 <span class="status-value" id="peerMac">Nao pareado</span>
             </div>
+            <div class="status-item">
+                <span class="status-label">Ultimo READY:</span>
+                <span class="status-value" id="lastReady">Nunca</span>
+            </div>
         </div>
         <button class="main-button" id="openBtn" onclick="openGate()">
             <span id="btnText">🚪 Abrir Portao</span>
         </button>
-        <div class="response-area" id="response">Sistema pronto para uso</div>
+        <div class="response-area" id="response">Sistema pronto - Procurando Portao ID )" + String(UNIQUE_DEVICE_ID) + R"rawliteral(</div>
         <div class="footer">
-            <a href="/unpair" class="footer-link">🔓 Desemparelhar Dispositivos</a>
+            <a href="/unpair" class="footer-link">🔓 Desemparelhar</a>
+            <a href="/reconnect" class="footer-link">🔄 Reconectar</a>
+            <a href="/info" class="footer-link">ℹ️ Info</a>
         </div>
     </div>
     <script>
@@ -201,15 +224,38 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                     try {
                         var data = JSON.parse(xhr.responseText);
                         document.getElementById('myMac').textContent = data.my || 'Erro';
+                        var statusEl = document.getElementById('connectionStatus');
+                        
+                        var lastReadyEl = document.getElementById('lastReady');
+                        if (data.lastReady && data.lastReady > 0) {
+                            var readyAge = Math.floor((data.uptime - data.lastReady/1000));
+                            lastReadyEl.textContent = readyAge + 's atrás';
+                        } else {
+                            lastReadyEl.textContent = 'Nunca';
+                        }
+                        
                         if (data.peer && data.peer.trim() !== '') {
                             document.getElementById('peerMac').textContent = data.peer;
-                            document.getElementById('connectionStatus').textContent = 'Conectado';
-                            document.getElementById('connectionStatus').className = 'connection-status connected';
-                            isConnected = true;
+                            
+                            var timeSinceReady = data.uptime*1000 - (data.lastReady || 0);
+                            if (timeSinceReady < 15000) {
+                                statusEl.textContent = 'Conectado';
+                                statusEl.className = 'connection-status connected';
+                                isConnected = true;
+                            } else {
+                                statusEl.textContent = 'Timeout';
+                                statusEl.className = 'connection-status disconnected';
+                                isConnected = false;
+                            }
+                        } else if (data.discovery) {
+                            document.getElementById('peerMac').textContent = 'Procurando...';
+                            statusEl.textContent = 'Descobrindo';
+                            statusEl.className = 'connection-status discovering';
+                            isConnected = false;
                         } else {
                             document.getElementById('peerMac').textContent = 'Aguardando...';
-                            document.getElementById('connectionStatus').textContent = 'Desconectado';
-                            document.getElementById('connectionStatus').className = 'connection-status disconnected';
+                            statusEl.textContent = 'Desconectado';
+                            statusEl.className = 'connection-status disconnected';
                             isConnected = false;
                         }
                         document.getElementById('openBtn').disabled = !isConnected;
@@ -235,7 +281,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                     setTimeout(function() {
                         btn.disabled = !isConnected; btn.classList.remove('pulse');
                         btnText.innerHTML = originalText;
-                    }, 1000);
+                    }, 1500);
                 }
             };
             xhr.send();
@@ -244,7 +290,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
             var el = document.getElementById('response');
             el.textContent = message; el.className = 'response-area ' + (type || '');
         }
-        window.onload = function() { loadStatus(); setInterval(loadStatus, 5000); };
+        window.onload = function() { loadStatus(); setInterval(loadStatus, 2000); };
         document.addEventListener('keydown', function(e) {
             if (e.code === 'Space' || e.key === 'Enter') {
                 e.preventDefault(); openGate();
@@ -266,17 +312,24 @@ void savePairToEEPROM() {
   EEPROM.begin(EEPROM_SIZE);
   gPair.magic = MAGIC_WORD;
   gPair.timestamp = millis();
+  gPair.uniqueId = UNIQUE_DEVICE_ID;  // Salva o ID único
   EEPROM.put(0, gPair);
   EEPROM.commit();
-  Serial.println("Pareamento salvo na EEPROM");
+  Serial.printf("Pareamento salvo na EEPROM (ID: %d)\n", gPair.uniqueId);
 }
 
 bool loadPairFromEEPROM() {
   EEPROM.begin(EEPROM_SIZE);
   EEPROM.get(0, gPair);
   if (gPair.magic == MAGIC_WORD && gPair.channel >= 1 && gPair.channel <= 13) {
-    Serial.printf("Pareamento carregado - Canal: %d\n", gPair.channel);
-    return true;
+    // Verifica se o ID salvo corresponde ao atual
+    if (gPair.uniqueId == UNIQUE_DEVICE_ID) {
+      Serial.printf("Pareamento carregado - Canal: %d, ID: %d\n", gPair.channel, gPair.uniqueId);
+      return true;
+    } else {
+      Serial.printf("ID diferente encontrado: %d (esperado: %d) - Limpando pareamento\n", 
+                    gPair.uniqueId, UNIQUE_DEVICE_ID);
+    }
   }
   memset(&gPair, 0, sizeof(gPair));
   return false;
@@ -291,6 +344,8 @@ void clearPairing() {
   EEPROM.commit();
   gPaired = false;
   gDiscoveryMode = true;
+  gReadyReceived = false;
+  lastReadyReceived = 0;
 }
 
 void ensurePeerExists(uint8_t *mac) {
@@ -307,20 +362,37 @@ void onDataSent(uint8_t *mac, uint8_t status) {
 }
 
 void onDataRecv(uint8_t *mac, uint8_t *data, uint8_t len) {
-  if (len != sizeof(esp_now_message)) return;
+  if (len != sizeof(esp_now_message)) {
+    Serial.printf("Tamanho incorreto: %d (esperado: %d) - Ignorando\n", len, sizeof(esp_now_message));
+    return;
+  }
 
   esp_now_message msg;
   memcpy(&msg, data, sizeof(msg));
 
-  Serial.printf("=== RESPOSTA RECEBIDA ===\n");
-  Serial.printf("deviceId=%d, cmd=%d, estado=%d, msg=%s\n",
-              msg.deviceId, msg.command, msg.relayState, msg.message);
+  Serial.printf("=== MENSAGEM RECEBIDA ===\n");
   Serial.printf("De: %s\n", macToStr(mac).c_str());
+  Serial.printf("uniqueId=%d, deviceType=%d, cmd=%d, estado=%d, msg=%s\n",
+                msg.uniqueId, msg.deviceType, msg.command, msg.relayState, msg.message);
+
+  // *** VERIFICAÇÃO DE ID ÚNICO ***
+  if (msg.uniqueId != UNIQUE_DEVICE_ID) {
+    Serial.printf("ID INCOMPATÍVEL: %d (esperado: %d) - IGNORANDO MENSAGEM\n", 
+                  msg.uniqueId, UNIQUE_DEVICE_ID);
+    return;
+  }
+
+  // Verifica se é de um Portão (deviceType = 1)
+  if (msg.deviceType != 1) {
+    Serial.printf("Tipo de dispositivo incorreto: %d (esperado: 1=Portão) - Ignorando\n", msg.deviceType);
+    return;
+  }
 
   // Resposta do portão durante pareamento
   if (!gPaired || gDiscoveryMode) {
     if (strcmp(msg.message, "READY") == 0) {
-      Serial.println("READY recebido - Estabelecendo pareamento...");
+      Serial.printf("READY (ID: %d) recebido - Estabelecendo pareamento...\n", msg.uniqueId);
+      lastReadyReceived = millis();
       memcpy(gPair.peer, mac, 6);
       gPair.channel = AP_CHANNEL;
 
@@ -328,26 +400,55 @@ void onDataRecv(uint8_t *mac, uint8_t *data, uint8_t len) {
       savePairToEEPROM();
       gPaired = true;
       gDiscoveryMode = false;
-      Serial.printf("PAREADO COM SUCESSO: %s\n", macToStr(gPair.peer).c_str());
+      gReadyReceived = true;
+      Serial.printf("PAREADO COM SUCESSO: %s (ID: %d)\n", macToStr(gPair.peer).c_str(), msg.uniqueId);
     }
+  }
+  
+  // READY de dispositivo já pareado
+  if (gPaired && strcmp(msg.message, "READY") == 0) {
+    lastReadyReceived = millis();
+    Serial.printf("READY recebido - Conexão mantida! (ID: %d)\n", msg.uniqueId);
   }
   
   // ACK de comando
   if (gPaired && strcmp(msg.message, "ACK") == 0) {
-    gAckReceived = true;
-    Serial.println("ACK DE COMANDO RECEBIDO - Sucesso!");
+    // Verifica se é do peer pareado
+    if (memcmp(gPair.peer, mac, 6) == 0) {
+      gAckReceived = true;
+      Serial.printf("ACK DE COMANDO RECEBIDO - Sucesso! (ID: %d)\n", msg.uniqueId);
+    } else {
+      Serial.printf("ACK de MAC não pareado: %s (esperado: %s)\n", 
+                   macToStr(mac).c_str(), macToStr(gPair.peer).c_str());
+    }
   }
 }
 
 // =================== Descoberta ====================
 void sendHelloBroadcast() {
-  if (!gDiscoveryMode && gPaired) return;
+  esp_now_message hello;
+  hello.uniqueId = UNIQUE_DEVICE_ID;
+  hello.deviceType = 2;  // 2 = Portaria
+  hello.command = 0;     // Comando de pareamento
+  hello.relayState = 0;
+  strcpy(hello.message, "HELLO");
 
-  const char *hello = "HELLO";
-  Serial.printf("Enviando HELLO broadcast (canal: %d)...\n", AP_CHANNEL);
+  Serial.printf("Enviando HELLO broadcast (ID: %d, canal: %d)...\n", UNIQUE_DEVICE_ID, AP_CHANNEL);
   
-  int result = esp_now_send(bcast, (uint8_t*)hello, strlen(hello));
+  int result = esp_now_send(bcast, (uint8_t*)&hello, sizeof(hello));
   Serial.printf("Resultado HELLO: %s\n", result == 0 ? "OK" : "ERRO");
+}
+
+void checkConnectionHealth() {
+  if (gPaired && lastReadyReceived > 0) {
+    uint32_t timeSinceReady = millis() - lastReadyReceived;
+    
+    if (timeSinceReady > 15000) {
+      Serial.printf("TIMEOUT: %lu ms sem READY - Iniciando reconexão\n", timeSinceReady);
+      gDiscoveryMode = true;
+      lastReconnectAttempt = millis();
+    }
+  }
 }
 
 // =================== Web Handlers ===================
@@ -364,9 +465,12 @@ void handleStatus(){
   json += "\"my\":\"" + macToStr(myMac) + "\",";
   json += "\"peer\":\"" + peerStrOrEmpty() + "\",";
   json += "\"paired\":" + String(gPaired ? "true" : "false") + ",";
+  json += "\"discovery\":" + String(gDiscoveryMode ? "true" : "false") + ",";
   json += "\"channel\":" + String(gPair.channel) + ",";
+  json += "\"uniqueId\":" + String(UNIQUE_DEVICE_ID) + ",";
   json += "\"uptime\":" + String(millis()/1000) + ",";
-  json += "\"heap\":" + String(ESP.getFreeHeap());
+  json += "\"heap\":" + String(ESP.getFreeHeap()) + ",";
+  json += "\"lastReady\":" + String(lastReadyReceived);
   json += "}";
   server.send(200, "application/json", json);
 }
@@ -377,13 +481,21 @@ void handleOpen(){
     return;
   }
 
-  Serial.println("=== INICIANDO COMANDO ABRIR ===");
+  uint32_t timeSinceReady = millis() - lastReadyReceived;
+  if (timeSinceReady > 15000) {
+    server.send(500, "text/plain", "Erro: Portao desconectado. Aguarde reconexao...");
+    gDiscoveryMode = true;
+    return;
+  }
+
+  Serial.printf("=== INICIANDO COMANDO ABRIR (ID: %d) ===\n", UNIQUE_DEVICE_ID);
   
   esp_now_message msg;
-  msg.deviceId = 1;                 // ID do ESP do portão
-  msg.command = 1;                  // 1 = abrir
-  msg.relayState = 0;               // Estado não é importante aqui
-  strcpy(msg.message, "ABRIR");     // Texto só para log/debug
+  msg.uniqueId = UNIQUE_DEVICE_ID;
+  msg.deviceType = 2;  // 2 = Portaria
+  msg.command = 1;     // 1 = abrir
+  msg.relayState = 0;
+  strcpy(msg.message, "ABRIR");
 
   gAckReceived = false;
   bool success = false;
@@ -391,24 +503,19 @@ void handleOpen(){
   for (int attempt = 1; attempt <= MAX_RETRY_ATTEMPTS && !success; attempt++) {
     Serial.printf("--- Tentativa %d/%d ---\n", attempt, MAX_RETRY_ATTEMPTS);
     
-    // Garante que o peer está adicionado
     ensurePeerExists(gPair.peer);
-    
-    // Delay antes do comando para estabilidade
     delay(COMMAND_DELAY);
     
-    // Envia o comando
     int result = esp_now_send(gPair.peer, (uint8_t*)&msg, sizeof(msg));
     Serial.printf("Comando enviado para %s - Resultado: %s\n", 
                   macToStr(gPair.peer).c_str(), result == 0 ? "OK" : "ERRO");
     
     if (result != 0) {
       Serial.printf("ERRO no envio (tentativa %d)\n", attempt);
-      delay(500); // Mais tempo antes de tentar novamente
+      delay(1000);
       continue;
     }
 
-    // Aguarda ACK com timeout
     uint32_t startTime = millis();
     Serial.printf("Aguardando ACK por %d ms...\n", ACK_TIMEOUT_MS);
     
@@ -418,19 +525,19 @@ void handleOpen(){
         success = true; 
         break; 
       }
-      delay(10);
-      yield(); // Importante para não travar o sistema
+      delay(20);
+      yield();
     }
     
     if (!success) {
-      Serial.printf("❌ TIMEOUT aguardando ACK (tentativa %d)\n", attempt);
+      Serial.printf("⌛ TIMEOUT aguardando ACK (tentativa %d)\n", attempt);
     }
     
-    gAckReceived = false; // Reset para próxima tentativa
+    gAckReceived = false;
 
     if (!success && attempt < MAX_RETRY_ATTEMPTS) {
       Serial.println("Aguardando antes da próxima tentativa...");
-      delay(500); // Intervalo entre tentativas
+      delay(1500);
     }
   }
 
@@ -438,7 +545,7 @@ void handleOpen(){
     Serial.println("=== ✅ COMANDO EXECUTADO COM SUCESSO ===");
     server.send(200, "text/plain", "Portao acionado com sucesso!");
   } else {
-    Serial.println("=== ❌ FALHA APÓS TODAS AS TENTATIVAS ===");
+    Serial.println("=== ⌛ FALHA APÓS TODAS AS TENTATIVAS ===");
     server.send(504, "text/plain", "Falha: Portao nao respondeu apos " + String(MAX_RETRY_ATTEMPTS) + " tentativas");
   }
 }
@@ -448,16 +555,36 @@ void handleUnpair(){
   server.send(200, "text/plain", "Pareamento removido. O sistema iniciara nova descoberta automaticamente.");
 }
 
+void handleReconnect(){
+  Serial.println("Forçando reconexão...");
+  if (gPaired) {
+    gDiscoveryMode = true;
+    lastReconnectAttempt = millis();
+    sendHelloBroadcast();
+  }
+  server.send(200, "text/plain", "Tentativa de reconexao iniciada.");
+}
+
 void handleInfo(){
   String info = "ESP-01 Portaria - Status do Sistema\n";
   info += "===================================\n";
+  info += "ID Único: " + String(UNIQUE_DEVICE_ID) + "\n";
   info += "MAC: " + macToStr(myMac) + "\n";
   info += "Canal: " + String(AP_CHANNEL) + "\n";
   info += "Pareado: " + String(gPaired ? "Sim" : "Nao") + "\n";
   if (gPaired) {
     info += "MAC Portao: " + macToStr(gPair.peer) + "\n";
     info += "Canal Peer: " + String(gPair.channel) + "\n";
+    info += "ID Salvo: " + String(gPair.uniqueId) + "\n";
     info += "Timestamp: " + String(gPair.timestamp) + "\n";
+    if (lastReadyReceived > 0) {
+      uint32_t timeSinceReady = millis() - lastReadyReceived;
+      info += "Ultimo READY: " + String(timeSinceReady/1000) + "s atras\n";
+      info += "Status Conexao: " + String(timeSinceReady < 15000 ? "ATIVA" : "TIMEOUT") + "\n";
+    } else {
+      info += "Ultimo READY: Nunca\n";
+      info += "Status Conexao: INATIVA\n";
+    }
   }
   info += "Discovery Mode: " + String(gDiscoveryMode ? "Ativo" : "Inativo") + "\n";
   info += "Uptime: " + String(millis()/1000) + "s\n";
@@ -472,26 +599,23 @@ void setup(){
   delay(1000);
   Serial.println();
   Serial.println("===========================================");
-  Serial.println("ESP-01 PORTARIA - Sistema de Controle");
+  Serial.printf("ESP-01 PORTARIA - ID ÚNICO: %d\n", UNIQUE_DEVICE_ID);
   Serial.println("===========================================");
 
-  // WiFi AP + STA mode
   WiFi.mode(WIFI_AP_STA);
   WiFi.softAP(AP_SSID, AP_PASS, AP_CHANNEL, false, AP_MAX_CONN);
-  WiFi.disconnect(); // Desconecta de qualquer rede STA
+  WiFi.disconnect();
   
-  // Força o canal WiFi
   wifi_set_channel(AP_CHANNEL);
-  
   wifi_get_macaddr(STATION_IF, myMac);
 
+  Serial.printf("ID Único: %d\n", UNIQUE_DEVICE_ID);
+  Serial.printf("Tipo: 2 (Portaria)\n");
   Serial.printf("AP Criado: %s\n", AP_SSID);
-  Serial.printf("Senha: %s\n", AP_PASS);
   Serial.printf("Canal: %d\n", AP_CHANNEL);
   Serial.printf("IP do AP: %s\n", WiFi.softAPIP().toString().c_str());
   Serial.printf("MAC STA: %s\n", macToStr(myMac).c_str());
 
-  // ESPNOW
   if (esp_now_init() != 0) {
     Serial.println("ERRO CRÍTICO: esp_now_init falhou!");
     while(true) {
@@ -504,53 +628,71 @@ void setup(){
   esp_now_register_send_cb(onDataSent);
   esp_now_register_recv_cb(onDataRecv);
 
-  // Peer broadcast para descoberta
   esp_now_del_peer(bcast);
   int bcastResult = esp_now_add_peer(bcast, ESP_NOW_ROLE_COMBO, AP_CHANNEL, NULL, 0);
   Serial.printf("Broadcast peer: %s\n", bcastResult == 0 ? "OK" : "ERRO");
 
-  // Carrega pareamento salvo
   gPaired = loadPairFromEEPROM();
   if (gPaired) {
-    Serial.printf("PAREAMENTO RESTAURADO: %s (canal %d)\n", 
-                  macToStr(gPair.peer).c_str(), gPair.channel);
+    Serial.printf("PAREAMENTO RESTAURADO: %s (ID: %d)\n", 
+                  macToStr(gPair.peer).c_str(), gPair.uniqueId);
     ensurePeerExists(gPair.peer);
     gDiscoveryMode = false;
     
-    Serial.println("Sistema pronto - Enviando HELLO para confirmar conexão...");
-    // Envia um HELLO inicial para confirmar que o portão ainda está ativo
-    delay(1000);
-    gDiscoveryMode = true; // Temporariamente ativa descoberta para testar
+    Serial.printf("Testando conexão com Portão ID: %d...\n", UNIQUE_DEVICE_ID);
     sendHelloBroadcast();
-    delay(2000);
-    if (!gPaired) {
-      Serial.println("Portão não respondeu - Continuando em modo descoberta");
+    
+    uint32_t testStart = millis();
+    gReadyReceived = false;
+    while (millis() - testStart < HELLO_TIMEOUT && !gReadyReceived) {
+      yield();
+      delay(100);
+    }
+    
+    if (gReadyReceived) {
+      Serial.printf("Portão ID %d respondeu - Conexão OK!\n", UNIQUE_DEVICE_ID);
+      lastReadyReceived = millis();
+    } else {
+      Serial.printf("Portão ID %d não respondeu - Ativando descoberta\n", UNIQUE_DEVICE_ID);
+      gDiscoveryMode = true;
     }
   } else {
-    Serial.println("NENHUM PAREAMENTO - Iniciando descoberta...");
+    Serial.printf("NENHUM PAREAMENTO - Procurando Portão ID: %d\n", UNIQUE_DEVICE_ID);
     gDiscoveryMode = true;
   }
 
-  // Servidor Web
   server.on("/", handleRoot);
   server.on("/status", handleStatus);
   server.on("/open", handleOpen);
   server.on("/unpair", handleUnpair);
+  server.on("/reconnect", handleReconnect);
   server.on("/info", handleInfo);
   server.begin();
 
   Serial.println("===========================================");
   Serial.println("SERVIDOR WEB: http://192.168.4.1");
-  Serial.println("SISTEMA PORTARIA PRONTO!");
+  Serial.printf("SISTEMA PORTARIA PRONTO! Aceita apenas ID: %d\n", UNIQUE_DEVICE_ID);
   Serial.println("===========================================");
 }
 
 void loop(){
   server.handleClient();
 
-  // Descoberta automática se não pareado ou em modo descoberta
   if (gDiscoveryMode && millis() - lastHello > HELLO_INTERVAL_MS) {
     lastHello = millis();
+    sendHelloBroadcast();
+  }
+
+  static uint32_t lastHealthCheck = 0;
+  if (millis() - lastHealthCheck > 5000) {
+    lastHealthCheck = millis();
+    checkConnectionHealth();
+  }
+
+  if (gPaired && gDiscoveryMode && 
+      millis() - lastReconnectAttempt > RECONNECT_INTERVAL) {
+    Serial.printf("Tentativa automática de reconexão (ID: %d)...\n", UNIQUE_DEVICE_ID);
+    lastReconnectAttempt = millis();
     sendHelloBroadcast();
   }
 
