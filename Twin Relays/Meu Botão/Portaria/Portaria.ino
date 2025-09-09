@@ -70,9 +70,7 @@ void setup() {
   
   // Configurar rotas do servidor web
   server.on("/", handleRoot);
-  server.on("/relay/on", handleRelayOn);
-  server.on("/relay/off", handleRelayOff);
-  server.on("/relay/pulse", handleRelayPulse);  // Adicionada rota para pulse
+  server.on("/relay/pulse", handleRelayPulse);  // Apenas rota para pulse
   server.on("/status", handleStatus);
   server.on("/scan", handleScan);
   
@@ -233,40 +231,6 @@ void printMAC(uint8_t* mac) {
   Serial.println();
 }
 
-// ==================== HANDLERS DO SERVIDOR WEB ====================
-
-// Ligar relay
-void handleRelayOn() {
-  if (!hasRelayDevice) {
-    server.send(400, "text/plain", "Nenhum relay conectado");
-    return;
-  }
-  
-  Serial.println("⚡ COMANDO: LIGAR RELAY");
-  currentRelayState = true;
-  sendRelayCommand(true, 1);
-  
-  // Redirecionar para página principal
-  server.sendHeader("Location", "/");
-  server.send(303);
-}
-
-// Desligar relay
-void handleRelayOff() {
-  if (!hasRelayDevice) {
-    server.send(400, "text/plain", "Nenhum relay conectado");
-    return;
-  }
-  
-  Serial.println("🔴 COMANDO: DESLIGAR RELAY");
-  currentRelayState = false;
-  sendRelayCommand(false, 2);
-  
-  // Redirecionar para página principal
-  server.sendHeader("Location", "/");
-  server.send(303);
-}
-
 // Comando temporizado para o relay (5 segundos)
 void handleRelayPulse() {
   if (!hasRelayDevice) {
@@ -359,9 +323,7 @@ void handleRoot() {
   
   html += "<div class='button-container'>";
   if (hasRelayDevice) {
-    html += "<a href='/relay/on' class='button on'>⚡ LIGAR RELAY</a>";
-    html += "<a href='/relay/off' class='button off'>🔴 DESLIGAR RELAY</a>";
-    html += "<a href='/relay/pulse' class='button pulse'>⏲️ PULSO 5s</a>";
+    html += "<a href='/relay/pulse' class='button pulse'>⏲️ Abrir Portão</a>";
   }
   html += "<a href='/scan' class='button scan'>🔄 BUSCAR DISPOSITIVOS</a>";
   html += "</div>";
