@@ -265,26 +265,47 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
             xhr.send();
         }
         function openGate() {
-            if (!isConnected) { setResponse('Erro: Portao nao pareado', 'error'); return; }
+            if (!isConnected) { 
+                setResponse('Erro: Portao nao pareado', 'error'); 
+                return; 
+            }
+            
             var btn = document.getElementById('openBtn');
             var btnText = document.getElementById('btnText');
             var originalText = btnText.innerHTML;
-            btn.disabled = true; btn.classList.add('pulse');
+
+            btn.disabled = true; 
+            btn.classList.add('pulse');
             btnText.innerHTML = '<span class="loading"></span> Acionando...';
-            var xhr = new XMLHttpRequest();
-            xhr.open('GET', '/open', true);
-            xhr.onreadystatechange = function() {
-                if (xhr.readyState == 4) {
-                    var message = xhr.responseText;
-                    setResponse((xhr.status == 200 ? '✅ ' : '❌ ') + message, 
-                               xhr.status == 200 ? 'success' : 'error');
+
+            // Envia comando ABRIR
+            var xhrOpen = new XMLHttpRequest();
+            xhrOpen.open('GET', '/open', true);
+            xhrOpen.onreadystatechange = function() {
+                if (xhrOpen.readyState == 4) {
+                    setResponse((xhrOpen.status == 200 ? '✅ ' : '❌ ') + xhrOpen.responseText,
+                                xhrOpen.status == 200 ? 'success' : 'error');
+
+                    // Aguarda 5 segundos antes de enviar FECHAR
                     setTimeout(function() {
-                        btn.disabled = !isConnected; btn.classList.remove('pulse');
-                        btnText.innerHTML = originalText;
-                    }, 1500);
+                        var xhrClose = new XMLHttpRequest();
+                        xhrClose.open('GET', '/close', true);
+                        xhrClose.onreadystatechange = function() {
+                            if (xhrClose.readyState == 4) {
+                                setResponse((xhrClose.status == 200 ? '✅ ' : '❌ ') + xhrClose.responseText,
+                                            xhrClose.status == 200 ? 'success' : 'error');
+
+                                // Reativa botão
+                                btn.disabled = !isConnected; 
+                                btn.classList.remove('pulse');
+                                btnText.innerHTML = originalText;
+                            }
+                        };
+                        xhrClose.send();
+                    }, 5000);
                 }
             };
-            xhr.send();
+            xhrOpen.send();
         }
         function setResponse(message, type) {
             var el = document.getElementById('response');
@@ -550,6 +571,78 @@ void handleOpen(){
   }
 }
 
+void handleClose() {
+    if (!gPaired) {
+        server.send(500, "text/plain", "Erro: Portao nao pareado. Aguardando conexao...");
+        return;
+    }
+
+    uint32_t timeSinceReady = millis() - lastReadyReceived;
+    if (timeSinceReady > 15000) {
+        server.send(500, "text/plain", "Erro: Portao desconectado. Aguarde reconexao...");
+        gDiscoveryMode = true;
+        return;
+    }
+
+    Serial.printf("=== INICIANDO COMANDO FECHAR (ID: %d) ===\n", UNIQUE_DEVICE_ID);
+
+    esp_now_message msg;
+    msg.uniqueId = UNIQUE_DEVICE_ID;
+    msg.deviceType = 2;  // 2 = Portaria
+    msg.command = 2;     // 2 = fechar
+    msg.relayState = 0;
+    strcpy(msg.message, "FECHAR");
+
+    gAckReceived = false;
+    bool success = false;
+
+    for (int attempt = 1; attempt <= MAX_RETRY_ATTEMPTS && !success; attempt++) {
+        Serial.printf("--- Tentativa %d/%d ---\n", attempt, MAX_RETRY_ATTEMPTS);
+        
+        ensurePeerExists(gPair.peer);
+        delay(COMMAND_DELAY);
+
+        int result = esp_now_send(gPair.peer, (uint8_t*)&msg, sizeof(msg));
+        Serial.printf("Comando enviado para %s - Resultado: %s\n", 
+                      macToStr(gPair.peer).c_str(), result == 0 ? "OK" : "ERRO");
+
+        if (result != 0) {
+            Serial.printf("ERRO no envio (tentativa %d)\n", attempt);
+            delay(1000);
+            continue;
+        }
+
+        uint32_t startTime = millis();
+        while (millis() - startTime < ACK_TIMEOUT_MS) {
+            if (gAckReceived) { 
+                Serial.println("✅ ACK RECEBIDO COM SUCESSO!");
+                success = true; 
+                break; 
+            }
+            delay(20);
+            yield();
+        }
+
+        if (!success) {
+            Serial.printf("⌛ TIMEOUT aguardando ACK (tentativa %d)\n", attempt);
+        }
+
+        gAckReceived = false;
+
+        if (!success && attempt < MAX_RETRY_ATTEMPTS) {
+            delay(1500);
+        }
+    }
+
+    if (success) {
+        Serial.println("=== ✅ COMANDO FECHAR EXECUTADO COM SUCESSO ===");
+        server.send(200, "text/plain", "Portao fechado com sucesso!");
+    } else {
+        Serial.println("=== ⌛ FALHA APÓS TODAS AS TENTATIVAS ===");
+        server.send(504, "text/plain", "Falha: Portao nao respondeu apos " + String(MAX_RETRY_ATTEMPTS) + " tentativas");
+    }
+}
+
 void handleUnpair(){
   clearPairing();
   server.send(200, "text/plain", "Pareamento removido. O sistema iniciara nova descoberta automaticamente.");
@@ -664,6 +757,7 @@ void setup(){
   server.on("/", handleRoot);
   server.on("/status", handleStatus);
   server.on("/open", handleOpen);
+  server.on("/close", handleClose);
   server.on("/unpair", handleUnpair);
   server.on("/reconnect", handleReconnect);
   server.on("/info", handleInfo);
