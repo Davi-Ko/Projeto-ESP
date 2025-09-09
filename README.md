@@ -1,4 +1,4 @@
-# {PROJECT SONOFF}
+# {PROJECT WIRELESS}
 
 ## First Version:
 
