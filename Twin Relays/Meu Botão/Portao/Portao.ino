@@ -2,6 +2,7 @@
  * ESP-01 RELAY COM AUTO-DISCOVERY
  * Este ESP responde automaticamente a broadcasts de descoberta
  * e se conecta com o servidor sem configuração manual
+ * VERSÃO TOTALMENTE CORRIGIDA - Timer isolado e preciso
  */
 
 #include <ESP8266WiFi.h>
@@ -13,8 +14,8 @@
 // LED interno para indicação visual (GPIO 2)
 #define LED_PIN 2
 
-// Configurações do timer
-#define TIMER_DURATION 5000  // 5 segundos em milissegundos
+// Configurações do timer - Timer mais preciso
+#define TIMER_DURATION 5000  // Exatos 5 segundos
 
 // Estrutura das mensagens (deve ser igual ao servidor)
 typedef struct {
@@ -36,15 +37,20 @@ bool connectedToServer = false;
 uint8_t serverMAC[6];
 unsigned long lastDiscoveryResponse = 0;
 
-// Variáveis do timer para acionamento temporizado
+// Variáveis do timer para acionamento temporizado - ISOLADAS
 bool timerActive = false;
 unsigned long timerStart = 0;
+bool forceRelayOff = false;
+
+// Variáveis para LED não interferir no timer
+unsigned long lastLedBlink = 0;
+bool ledState = HIGH; // LED invertido no ESP-01
 
 void setup() {
   Serial.begin(115200);
   delay(1000);
   
-  Serial.println("\n=== ESP-01 Relay com Auto-Discovery ===");
+  Serial.println("\n=== ESP-01 Relay Timer CORRIGIDO ===");
   
   // Configurar pinos
   pinMode(RELAY_PIN, OUTPUT);
@@ -66,8 +72,8 @@ void setup() {
   // Inicializar ESP-NOW
   initESPNow();
   
-  // Piscar LED para indicar inicialização
-  for (int i = 0; i < 6; i++) {
+  // Piscar LED para indicar inicialização (sem delay no loop)
+  for (int i = 0; i < 3; i++) {
     digitalWrite(LED_PIN, LOW);
     delay(200);
     digitalWrite(LED_PIN, HIGH);
@@ -75,34 +81,62 @@ void setup() {
   }
   
   Serial.println("✅ Sistema pronto - aguardando comandos...");
+  Serial.println("⏰ Timer configurado para: " + String(TIMER_DURATION) + "ms EXATOS");
 }
 
 void loop() {
-  // Verificar timer ativo
-  if (timerActive && (millis() - timerStart >= TIMER_DURATION)) {
-    Serial.println("⏰ Timer expirado - desligando relay");
-    timerActive = false;
-    controlRelay(false);
-  }
-  
-  // LED de status - piscar lento se desconectado, rápido se conectado
-  static unsigned long lastBlink = 0;
-  unsigned long blinkInterval = connectedToServer ? 2000 : 500;
-  
-  if (millis() - lastBlink > blinkInterval) {
-    digitalWrite(LED_PIN, !digitalRead(LED_PIN));
-    lastBlink = millis();
+  // ===== VERIFICAÇÃO DO TIMER - PRIORIDADE ABSOLUTA =====
+  if (timerActive) {
+    unsigned long elapsed = millis() - timerStart;
     
-    // Status periódico
-    static int statusCount = 0;
-    statusCount++;
-    if (statusCount >= (connectedToServer ? 5 : 10)) {
-      showStatus();
-      statusCount = 0;
+    // Verificar se expirou COM PRECISÃO
+    if (elapsed >= TIMER_DURATION) {
+      Serial.println("\n==========================================");
+      Serial.println("⏰ TIMER EXPIROU - DESLIGANDO RELAY AGORA");
+      Serial.println("   Tempo decorrido: " + String(elapsed) + "ms");
+      Serial.println("   Esperado: " + String(TIMER_DURATION) + "ms");
+      Serial.println("==========================================");
+      
+      // FORÇAR desligamento imediato
+      timerActive = false;
+      currentRelayState = false;
+      digitalWrite(RELAY_PIN, LOW);
+      
+      // LED volta ao estado "conectado" (apagado)
+      digitalWrite(LED_PIN, HIGH);
+      
+      Serial.println("🔴 RELAY DESLIGADO - Timer concluído");
+    }
+    
+    // Status do timer a cada segundo (SEM interferir no timing)
+    static unsigned long lastTimerStatus = 0;
+    if (millis() - lastTimerStatus >= 1000) {
+      unsigned long remaining = TIMER_DURATION - elapsed;
+      if (remaining <= TIMER_DURATION) { // Evitar underflow
+        Serial.println("⏱️ Timer: " + String(remaining) + "ms restantes");
+      }
+      lastTimerStatus = millis();
     }
   }
   
-  delay(50);
+  // ===== LED STATUS (sem interferir no timer) =====
+  if (millis() - lastLedBlink >= (connectedToServer ? 2000 : 500)) {
+    ledState = !ledState;
+    if (!timerActive) { // Só controlar LED se timer não estiver ativo
+      digitalWrite(LED_PIN, ledState);
+    }
+    lastLedBlink = millis();
+  }
+  
+  // Status periódico (reduzido para não interferir)
+  static unsigned long lastStatus = 0;
+  if (millis() - lastStatus >= 10000) { // A cada 10 segundos
+    showStatus();
+    lastStatus = millis();
+  }
+  
+  // DELAY MÍNIMO para não sobrecarregar CPU
+  delay(10);
 }
 
 void initESPNow() {
@@ -173,15 +207,33 @@ void OnDataRecv(uint8_t *mac, uint8_t *incomingData, uint8_t len) {
     Serial.println("   Comando: " + String(incomingMsg.command));
     Serial.println("   Total comandos: " + String(commandCount));
     
-    // Verificar se é comando temporizado
-    if (incomingMsg.command == 5) {
-      Serial.println("⏰ Comando temporizado detectado - " + String(TIMER_DURATION / 1000) + " segundos");
-      timerActive = true;
+    // ===== COMANDO TEMPORIZADO ESPECIAL =====
+    if (incomingMsg.command == 5 && incomingMsg.relayState) {
+      Serial.println("\n🚀 COMANDO TEMPORIZADO DETECTADO!");
+      Serial.println("==========================================");
+      Serial.println("⚡ INICIANDO TIMER DE " + String(TIMER_DURATION) + "ms");
+      Serial.println("==========================================");
+      
+      // RESETAR qualquer timer anterior
+      timerActive = false;
+      
+      // LIGAR RELAY IMEDIATAMENTE
+      currentRelayState = true;
+      digitalWrite(RELAY_PIN, HIGH);
+      digitalWrite(LED_PIN, LOW); // LED ligado (invertido)
+      
+      // INICIAR TIMER COM TIMESTAMP PRECISO
       timerStart = millis();
+      timerActive = true;
+      
+      Serial.println("✅ RELAY LIGADO - Timer iniciado às " + String(timerStart) + "ms");
+      Serial.println("🎯 Desligamento programado para: " + String(timerStart + TIMER_DURATION) + "ms");
+      
+    } else if (incomingMsg.command != 5) {
+      // Comando normal (não temporizado)
+      Serial.println("📝 Comando normal - controlando relay diretamente");
+      controlRelayNormal(incomingMsg.relayState);
     }
-    
-    // Controlar o relay
-    controlRelay(incomingMsg.relayState);
   }
 }
 
@@ -189,7 +241,7 @@ void respondToDiscovery(uint8_t* serverMac) {
   // Adicionar servidor como peer se não foi adicionado
   if (!connectedToServer) {
     esp_now_add_peer(serverMac, ESP_NOW_ROLE_COMBO, 1, NULL, 0);
-    Serial.println("🔄 Servidor adicionado como peer");
+    Serial.println("📄 Servidor adicionado como peer");
   }
   
   // Preparar resposta
@@ -209,31 +261,28 @@ void respondToDiscovery(uint8_t* serverMac) {
   }
 }
 
-void controlRelay(bool state) {
-  currentRelayState = state;
-  
-  // Controlar relay
-  digitalWrite(RELAY_PIN, state ? HIGH : LOW);
-  
-  // Feedback visual no LED (invertido no ESP-01)
-  if (state) {
-    // Relay ligado = LED piscando rápido
-    for (int i = 0; i < 6; i++) {
-      digitalWrite(LED_PIN, LOW);
-      delay(100);
-      digitalWrite(LED_PIN, HIGH);
-      delay(100);
-    }
-  } else {
-    // Relay desligado = LED apagado
-    digitalWrite(LED_PIN, HIGH);
+// Função para comando normal (não temporizado)
+void controlRelayNormal(bool state) {
+  // NUNCA interferir se timer estiver ativo
+  if (timerActive) {
+    Serial.println("⚠️ TIMER ATIVO - Comando normal IGNORADO");
+    return;
   }
   
-  // Feedback serial
-  Serial.println(state ? "⚡ RELAY LIGADO" : "🔴 RELAY DESLIGADO");
+  currentRelayState = state;
+  digitalWrite(RELAY_PIN, state ? HIGH : LOW);
+  
+  if (state) {
+    digitalWrite(LED_PIN, LOW); // LED ligado (invertido)
+  } else {
+    digitalWrite(LED_PIN, HIGH); // LED desligado
+  }
+  
+  Serial.println("==========================================");
+  Serial.println(state ? "⚡ RELAY LIGADO (normal)" : "🔴 RELAY DESLIGADO (normal)");
   Serial.println("   GPIO 0: " + String(state ? "HIGH" : "LOW"));
-  Serial.println("   Status LED atualizado");
-  Serial.println();
+  Serial.println("   Timer ativo: NÃO");
+  Serial.println("==========================================");
 }
 
 void printMAC(uint8_t* mac) {
@@ -245,13 +294,20 @@ void printMAC(uint8_t* mac) {
 }
 
 void showStatus() {
-  Serial.println("📊 STATUS DO SISTEMA:");
+  Serial.println("\n📊 STATUS DO SISTEMA:");
   Serial.println("   🔗 Conectado: " + String(connectedToServer ? "SIM" : "NÃO"));
   Serial.println("   ⚡ Relay: " + String(currentRelayState ? "LIGADO" : "DESLIGADO"));
+  Serial.println("   🔍 GPIO 0: " + String(digitalRead(RELAY_PIN) ? "HIGH" : "LOW"));
   
   if (timerActive) {
-    unsigned long remaining = TIMER_DURATION - (millis() - timerStart);
-    Serial.println("   ⏰ Timer: " + String(remaining / 1000) + "s restantes");
+    unsigned long elapsed = millis() - timerStart;
+    unsigned long remaining = TIMER_DURATION - elapsed;
+    Serial.println("   ⏰ Timer: ATIVO");
+    Serial.println("   ⏱️ Decorrido: " + String(elapsed) + "ms");
+    Serial.println("   ⏳ Restante: " + String(remaining) + "ms");
+    Serial.println("   🎯 Iniciado em: " + String(timerStart) + "ms");
+  } else {
+    Serial.println("   ⏰ Timer: INATIVO");
   }
   
   Serial.println("   📡 Comandos: " + String(commandCount));

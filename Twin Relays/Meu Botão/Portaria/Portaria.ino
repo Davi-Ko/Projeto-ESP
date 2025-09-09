@@ -2,6 +2,7 @@
  * ESP-01 SERVIDOR WEB COM ESP-NOW AUTO-DISCOVERY
  * Este ESP cria um ponto de acesso Wi-Fi, encontra automaticamente
  * outros ESPs e se conecta via ESP-NOW sem configuração manual
+ * Versão CORRIGIDA - Timer apenas para UI, não controla relay remoto
  */
 
 #include <ESP8266WiFi.h>
@@ -41,23 +42,27 @@ ESPMessage incomingMsg;
 ESP8266WebServer server(80);
 
 // Status do relay (para controle local)
-bool currentRelayState = false;
 bool espNowInitialized = false;
 bool hasRelayDevice = false;
 uint8_t relayMAC[6];
+
+// Controle do timer APENAS PARA INTERFACE (não controla relay remoto)
+bool buttonDisabled = false;
+unsigned long buttonDisabledStart = 0;
+const unsigned long BUTTON_DISABLE_DURATION = 5500; // 5.5 segundos para garantir
 
 void setup() {
   Serial.begin(115200);
   delay(1000);
   
-  Serial.println("\n=== ESP-01 Servidor Web com Auto-Discovery ===");
+  Serial.println("\n=== ESP-01 Servidor Web com Auto-Discovery CORRIGIDO ===");
   
   // Configurar como Access Point E Station (necessário para ESP-NOW)
   WiFi.mode(WIFI_AP_STA);
   WiFi.softAP(ssid, password);
   
   IPAddress IP = WiFi.softAPIP();
-  Serial.print("📶 IP do Access Point: ");
+  Serial.print("🔶 IP do Access Point: ");
   Serial.println(IP);
   Serial.print("📡 MAC do Servidor: ");
   Serial.println(WiFi.macAddress());
@@ -70,7 +75,7 @@ void setup() {
   
   // Configurar rotas do servidor web
   server.on("/", handleRoot);
-  server.on("/relay/pulse", handleRelayPulse);  // Apenas rota para pulse
+  server.on("/relay/pulse", handleRelayPulse);
   server.on("/status", handleStatus);
   server.on("/scan", handleScan);
   
@@ -84,6 +89,12 @@ void setup() {
 
 void loop() {
   server.handleClient();
+  
+  // Verificar se o botão deve ser reabilitado (APENAS PARA UI)
+  if (buttonDisabled && (millis() - buttonDisabledStart >= BUTTON_DISABLE_DURATION)) {
+    buttonDisabled = false;
+    Serial.println("⏰ Botão reabilitado - relay deve ter desligado automaticamente");
+  }
   
   // Auto-discovery periódico
   if (millis() - lastDiscovery > 5000) {  // A cada 5 segundos
@@ -238,10 +249,19 @@ void handleRelayPulse() {
     return;
   }
   
-  Serial.println("⚡ ACIONAMENTO TEMPORIZADO - 5 segundos");
+  // Verificar se o botão ainda está desabilitado
+  if (buttonDisabled) {
+    server.send(400, "text/plain", "Relay ainda em ativação, aguarde...");
+    return;
+  }
   
-  // Ligar relay
-  currentRelayState = true;
+  Serial.println("⚡ ACIONAMENTO TEMPORIZADO - O relay controlará seu próprio timer");
+  
+  // Desabilitar botão APENAS para interface (não controla relay remoto)
+  buttonDisabled = true;
+  buttonDisabledStart = millis();
+  
+  // Enviar comando - O RELAY se encarregará do timer
   sendRelayCommand(true, 5);  // comando especial = 5 (indica temporizado)
   
   server.sendHeader("Location", "/");
@@ -253,20 +273,26 @@ void handleScan() {
   Serial.println("🔄 Forçando reconexão...");
   hasRelayDevice = false;
   deviceCount = 0;
-  currentRelayState = false;
+  buttonDisabled = false; // Resetar botão também
   Serial.println("   Dispositivo atual desconectado");
   Serial.println("   Iniciando nova busca...");
   server.sendHeader("Location", "/");
   server.send(303);
 }
 
-// Status em JSON
+// Status em JSON - Agora apenas informa sobre botão
 void handleStatus() {
   String json = "{";
-  json += "\"relay\":" + String(currentRelayState ? "true" : "false") + ",";
   json += "\"hasRelay\":" + String(hasRelayDevice ? "true" : "false") + ",";
   json += "\"devices\":" + String(deviceCount) + ",";
-  json += "\"espnow\":" + String(espNowInitialized ? "true" : "false");
+  json += "\"espnow\":" + String(espNowInitialized ? "true" : "false") + ",";
+  json += "\"buttonDisabled\":" + String(buttonDisabled ? "true" : "false");
+  
+  if (buttonDisabled) {
+    unsigned long remaining = BUTTON_DISABLE_DURATION - (millis() - buttonDisabledStart);
+    json += ",\"timeRemaining\":" + String(remaining);
+  }
+  
   json += "}";
   server.send(200, "application/json", json);
 }
@@ -283,56 +309,78 @@ void handleRoot() {
   html += "h1{color:#333;text-align:center;margin-bottom:10px;font-size:1.8em}";
   html += ".subtitle{text-align:center;color:#666;margin-bottom:30px;font-style:italic}";
   html += ".status{text-align:center;margin:20px 0;padding:15px;border-radius:10px;font-weight:bold;font-size:1.1em}";
-  html += ".status.on{background:linear-gradient(45deg,#28a745,#20c997);color:white;box-shadow:0 4px 15px rgba(40,167,69,0.3)}";
-  html += ".status.off{background:linear-gradient(45deg,#dc3545,#e83e8c);color:white;box-shadow:0 4px 15px rgba(220,53,69,0.3)}";
+  html += ".status.ready{background:linear-gradient(45deg,#28a745,#20c997);color:white;box-shadow:0 4px 15px rgba(40,167,69,0.3)}";
+  html += ".status.active{background:linear-gradient(45deg,#ff6b35,#f7931e);color:white;box-shadow:0 4px 15px rgba(255,107,53,0.3)}";
   html += ".status.disconnected{background:linear-gradient(45deg,#ffc107,#fd7e14);color:#333;box-shadow:0 4px 15px rgba(255,193,7,0.3)}";
   html += ".button{display:inline-block;margin:10px;padding:15px 25px;font-size:16px;border:none;border-radius:10px;cursor:pointer;text-decoration:none;text-align:center;font-weight:bold;transition:all 0.3s ease;box-shadow:0 4px 15px rgba(0,0,0,0.2)}";
-  html += ".button.on{background:linear-gradient(45deg,#28a745,#20c997);color:white}.button.on:hover{transform:translateY(-2px);box-shadow:0 6px 20px rgba(40,167,69,0.4)}";
-  html += ".button.off{background:linear-gradient(45deg,#dc3545,#e83e8c);color:white}.button.off:hover{transform:translateY(-2px);box-shadow:0 6px 20px rgba(220,53,69,0.4)}";
   html += ".button.pulse{background:linear-gradient(45deg,#ff6b35,#f7931e);color:white}.button.pulse:hover{transform:translateY(-2px);box-shadow:0 6px 20px rgba(255,107,53,0.4)}";
   html += ".button.scan{background:linear-gradient(45deg,#007bff,#6f42c1);color:white}.button.scan:hover{transform:translateY(-2px);box-shadow:0 6px 20px rgba(0,123,255,0.4)}";
+  html += ".button:disabled{background:linear-gradient(45deg,#6c757d,#adb5bd)!important;color:#fff!important;cursor:not-allowed!important;transform:none!important;box-shadow:none!important}";
   html += ".button-container{text-align:center;margin:25px 0}";
   html += ".info{background:rgba(0,123,255,0.1);padding:20px;border-radius:10px;margin-top:20px;border-left:4px solid #007bff}";
   html += ".devices{background:rgba(40,167,69,0.1);padding:15px;border-radius:10px;margin-top:15px;border-left:4px solid #28a745}";
   html += ".device-item{background:white;margin:8px 0;padding:10px;border-radius:8px;box-shadow:0 2px 5px rgba(0,0,0,0.1)}";
+  html += ".timer-display{background:rgba(255,193,7,0.2);border:2px solid #ffc107;border-radius:10px;padding:15px;margin:15px 0;text-align:center;font-weight:bold;font-size:1.2em;color:#856404}";
   html += "@keyframes pulse{0%{transform:scale(1)}50%{transform:scale(1.05)}100%{transform:scale(1)}}";
   html += ".pulse{animation:pulse 2s infinite}";
   html += "</style>";
   html += "<script>";
   html += "function updateStatus(){fetch('/status').then(r=>r.json()).then(d=>{";
   html += "let statusEl=document.getElementById('status');";
+  html += "let pulseBtn=document.getElementById('pulseBtn');";
+  html += "let timerEl=document.getElementById('timer');";
   html += "let statusText='';let statusClass='';";
-  html += "if(d.hasRelay){statusText='🔗 Relay Conectado - '+(d.relay?'LIGADO':'DESLIGADO');statusClass='status '+(d.relay?'on':'off');}";
-  html += "else{statusText='🔍 Procurando dispositivos...';statusClass='status disconnected pulse';}";
+  html += "if(d.hasRelay){";
+  html += "if(d.buttonDisabled){statusText='⚡ COMANDO ENVIADO - Aguarde...';statusClass='status active pulse';";
+  html += "pulseBtn.disabled=true;pulseBtn.innerHTML='⏳ Aguarde...';}";
+  html += "else{statusText='🔗 Relay Conectado - PRONTO';statusClass='status ready';";
+  html += "pulseBtn.disabled=false;pulseBtn.innerHTML='▶️ Abrir Portão';}";
+  html += "}else{statusText='🔍 Procurando dispositivos...';statusClass='status disconnected pulse';";
+  html += "pulseBtn.disabled=true;pulseBtn.innerHTML='🔍 Sem Dispositivo';}";
   html += "statusEl.innerHTML=statusText;statusEl.className=statusClass;";
+  html += "if(d.buttonDisabled&&d.timeRemaining){";
+  html += "let seconds=Math.ceil(d.timeRemaining/1000);";
+  html += "timerEl.style.display='block';";
+  html += "timerEl.innerHTML='⏰ Botão liberado em: '+seconds+' segundos';";
+  html += "}else{timerEl.style.display='none';}";
   html += "})}";
-  html += "setInterval(updateStatus,2000);";
+  html += "setInterval(updateStatus,500);";
   html += "</script>";
   html += "</head><body>";
   html += "<div class='container'>";
   html += "<h1>🚀 ESP-01 Auto-Discovery</h1>";
   html += "<div class='subtitle'>Sistema Inteligente de Controle</div>";
   
-  String statusClass = hasRelayDevice ? (currentRelayState ? "on" : "off") : "disconnected pulse";
+  String statusClass = hasRelayDevice ? 
+    (buttonDisabled ? "active pulse" : "ready") : 
+    "disconnected pulse";
   String statusText = hasRelayDevice ? 
-    ("🔗 Relay Conectado - " + String(currentRelayState ? "LIGADO" : "DESLIGADO")) :
+    (buttonDisabled ? "⚡ COMANDO ENVIADO - Aguarde..." : "🔗 Relay Conectado - PRONTO") :
     "🔍 Procurando dispositivos...";
     
   html += "<div id='status' class='status " + statusClass + "'>";
   html += statusText + "</div>";
   
+  // Timer display
+  html += "<div id='timer' class='timer-display' style='display:none;'></div>";
+  
   html += "<div class='button-container'>";
   if (hasRelayDevice) {
-    html += "<a href='/relay/pulse' class='button pulse'>⏲️ Abrir Portão</a>";
+    String buttonText = buttonDisabled ? "⏳ Aguarde..." : "▶️ Abrir Portão";
+    String buttonState = buttonDisabled ? "disabled" : "";
+    html += "<button id='pulseBtn' onclick=\"if(!this.disabled)window.location.href='/relay/pulse'\" class='button pulse' " + buttonState + ">" + buttonText + "</button>";
+  } else {
+    html += "<button id='pulseBtn' class='button pulse' disabled>🔍 Sem Dispositivo</button>";
   }
   html += "<a href='/scan' class='button scan'>🔄 BUSCAR DISPOSITIVOS</a>";
   html += "</div>";
   
   html += "<div class='info'>";
-  html += "<strong>📡 Sistema:</strong> ESP-NOW Auto-Discovery<br>";
-  html += "<strong>📶 Rede:</strong> " + String(ssid) + "<br>";
+  html += "<strong>📡 Sistema:</strong> ESP-NOW Auto-Discovery (Timer Corrigido)<br>";
+  html += "<strong>🔶 Rede:</strong> " + String(ssid) + "<br>";
   html += "<strong>🌐 IP:</strong> " + WiFi.softAPIP().toString() + "<br>";
-  html += "<strong>🔍 Dispositivos:</strong> " + String(deviceCount) + " encontrados";
+  html += "<strong>🔍 Dispositivos:</strong> " + String(deviceCount) + " encontrados<br>";
+  html += "<strong>🔧 Status:</strong> Relay controla próprio timer";
   html += "</div>";
   
   if (deviceCount > 0) {
